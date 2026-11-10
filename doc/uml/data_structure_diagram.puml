@@ -31,8 +31,10 @@ class display_snapshot_t {
   +int16_t temperature_c_x100
   +uint16_t humidity_pct_x100
   +uint16_t pressure_mmhg
+  +uint16_t buffer_used
   +bool logging_enabled
   +bool partition_full
+  +bool sensor_ok
 }
 
 class uart_command_t {

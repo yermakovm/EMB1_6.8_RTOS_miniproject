@@ -33,3 +33,6 @@ Icon?
 *.swp
 *.bak
 *~
+
+# ESP-IDF build directory
+build/
