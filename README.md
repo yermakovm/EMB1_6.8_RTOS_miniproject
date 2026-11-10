@@ -17,10 +17,12 @@ This project demonstrates:
 ## Hardware
 
 - **ESP32-S3 N16R8**
-- **BME280** — temperature, humidity, pressure sensor
-- **DS1306** — real-time clock for timestamp
-- **SSD1306** — OLED display
+- **BME280** — temperature, humidity, pressure sensor (I2C `0x76`)
+- **DS1306** — real-time clock for timestamp (I2C `0x68`, DS1307-compatible)
+- **SSD1306** — OLED display 128×64 (I2C `0x3C`)
 - UART terminal for commands
+
+All three devices share one I2C bus: **SDA = GPIO5, SCL = GPIO4** (internal pull-ups enabled).
 
 ## Main idea
 
@@ -69,7 +71,7 @@ Responsible for:
 - receiving UART commands
 - deciding when to append a record to the RAM buffer
 - forcing flash flush when the buffer is full
-- entering Light Sleep for 1 second
+- keeping every task blocked between cycles so the IDLE task can enter Light Sleep
 
 ### 5. Flash Writer Task
 Responsible for:
@@ -84,6 +86,7 @@ Responsible for:
 The project uses an **I2C Mutex** because multiple devices share the bus:
 
 - BME280
+- DS1306
 - SSD1306
 
 Only one task may use the I2C bus at a time.
@@ -94,6 +97,9 @@ The project uses the following queues:
 - `sensor_queue` — Sensor Task → Manager Task
 - `command_queue` — UART Task → Manager Task
 - `display_queue` — Manager Task → Display Task
+- `flash_queue` — Manager Task → Flash Writer Task (pointer + length of the RAM buffer,
+  not a 4 KB copy; the buffer is not touched again until the writer answers)
+- `flash_result_queue` — Flash Writer Task → Manager Task (`OK` / `FULL` / `ERR`)
 
 ## Logging format
 
@@ -117,6 +123,9 @@ Example:
 - `56.78 %` → `5678`
 
 This is more compact than storing strings and is easier to write to flash efficiently.
+
+With `sizeof(log_record_t) == 14`: **292 records per 4096-byte sector**, and
+**74 752 records** (≈ 52 days at 1 record per minute) in the 1 MB `logdata` partition.
 
 ## RAM buffer strategy
 
@@ -157,6 +166,21 @@ Behavior:
 
 This demonstrates basic energy-saving behavior while still keeping the system responsive.
 
+`esp_light_sleep_start()` is **not** called from a task — that is not safe while FreeRTOS runs.
+Light Sleep is entered by the **FreeRTOS IDLE task** (tickless idle): IDF's `vApplicationSleep()`
+computes the idle time, arms a timer wakeup, calls `esp_light_sleep_start()` and fixes the tick
+count with `vTaskStepTick()`. Enabled in `sdkconfig.defaults`:
+
+```
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP=2
+```
+
+This only works because no task busy-waits: every task blocks on a queue or on `vTaskDelay()`.
+`CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP` stays off so the I2C bus and the SSD1306 keep
+their configuration across Light Sleep.
+
 ## UART commands
 
 Supported commands:
@@ -164,6 +188,53 @@ Supported commands:
 - `help` — show command list
 - `status` — show current system status
 - `flush` — force write current RAM buffer to flash
+- `dump [n]` — print the last *n* records (default 20) of the last written sector
 - `erase` — erase log partition and clear log buffer
 - `log on` — enable logging
 - `log off` — disable logging
+
+Parsing ignores spaces and case, so `log on`, `logon` and `LOG ON` are the same command.
+`erase` wipes 1 MB of flash, so the display freezes for a second or two while it runs.
+
+> Console caveat: between the 1-second cycles the chip is in Light Sleep. Input typed while
+> asleep is buffered by the console peripheral and processed on the next wake, but if you ever
+> see dropped characters, set `CONFIG_PM_ENABLE=n` in `sdkconfig.defaults` to disable Light Sleep.
+
+---
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `src/main.c` | the 5 tasks, sensors, display, flash writer, UART commands |
+| `src/font8x8.h` | public-domain 8×8 bitmap font used to draw text on the SSD1306 |
+| `partitions.csv` | custom partition table with the 1 MB `logdata` partition |
+| `sdkconfig.defaults` | target, 16 MB flash, custom partition table, tickless idle (Light Sleep) |
+| `src/CMakeLists.txt` | component registration: `esp_driver_i2c`, `esp_lcd`, `esp_partition`, `esp_timer` |
+
+---
+
+## Build & Flash
+
+### PlatformIO
+
+```bash
+pio run -t upload && pio device monitor
+```
+
+> `platformio.ini` uses `board = esp32-s3-devkitc-1`; the N16R8V variant is expressed through
+> `sdkconfig.defaults` (16 MB flash), because `esp32-s3-devkitc-1-n16r8v` is not a PlatformIO board name.
+
+### ESP-IDF
+
+```bash
+idf.py set-target esp32s3 && idf.py build flash monitor
+```
+
+Compile-time knobs (top of `src/main.c`):
+
+```c
+#define WAKE_PERIOD_MS        1000  // one measurement + display cycle
+#define LOG_INTERVAL_MINUTES  1     // log to flash once every N minutes
+#define FLASH_SECTOR_SIZE     4096  // RAM log buffer = 1 flash sector
+```
