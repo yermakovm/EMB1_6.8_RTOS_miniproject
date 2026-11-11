@@ -54,6 +54,7 @@ static const char *TAG = "logger";
 #define BME280_ID             0x60
 #define BME280_REG_SOFTRESET  0xE0
 #define BME280_REG_CTRL_HUM   0xF2
+#define BME280_REG_STATUS     0xF3
 #define BME280_REG_CTRL_MEAS  0xF4
 #define BME280_REG_CONFIG     0xF5
 #define BME280_REG_PRESS      0xF7   // press[3], hum[2], temp[3]
@@ -90,12 +91,18 @@ typedef struct {
 } display_snapshot_t;
 
 typedef enum {
-    CMD_HELP, CMD_STATUS, CMD_LOG_ON, CMD_LOG_OFF, CMD_FLUSH, CMD_ERASE, CMD_DUMP
+    CMD_HELP, CMD_STATUS, CMD_LOG_ON, CMD_LOG_OFF, CMD_FLUSH, CMD_ERASE, CMD_DUMP, CMD_SET_TIME
 } command_type_t;
+
+typedef struct {
+    int16_t year;
+    uint8_t month, day, hour, minute, second;
+} rtc_time_w_t;
 
 typedef struct {
     command_type_t type;
     int32_t argument;
+    rtc_time_w_t rtc;
 } uart_command_t;
 
 typedef struct {
@@ -164,6 +171,17 @@ static esp_err_t bme280_init(void)
     I2C_UNLOCK();
     vTaskDelay(pdMS_TO_TICKS(10));
 
+    // After a soft reset the chip reloads its trim data from NVM; reading 0x88 too early
+    // returns garbage, which then produces a nonsense temperature.
+    for (int i = 0; err == ESP_OK && i < 50; i++) {
+        uint8_t status = 0;
+        I2C_LOCK();
+        err = i2c_read_reg(s_bme_dev, BME280_REG_STATUS, &status, 1);
+        I2C_UNLOCK();
+        if (err != ESP_OK || (status & 0x01) == 0) break;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
     uint8_t id = 0, cal[24], h1 = 0, h[7];
     I2C_LOCK();
     if (err == ESP_OK) err = i2c_read_reg(s_bme_dev, BME280_REG_ID, &id, 1);
@@ -177,7 +195,11 @@ static esp_err_t bme280_init(void)
     I2C_UNLOCK();
 
     if (err != ESP_OK) return err;
-    if (id != BME280_ID) return ESP_ERR_INVALID_RESPONSE;
+    if (id != BME280_ID) {
+        ESP_LOGW(TAG, "unexpected chip id 0x%02X at address 0x%02X (expected 0x60; a BME280 with SDO high lives at 0x77)",
+                 id, BME280_ADDR);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
 
     s_bme.t1 = le16(&cal[0]);
     s_bme.t2 = (int16_t)le16(&cal[2]);
@@ -218,6 +240,13 @@ static esp_err_t bme280_read(int16_t *temp_c_x100, uint16_t *hum_pct_x100, uint1
     const int32_t adc_h = (int32_t)((d[3] << 8) | d[4]);
     const int32_t adc_t = (int32_t)((d[5] << 12) | (d[6] << 4) | (d[7] >> 4));
 
+    if (adc_t == 0 || adc_t == 0x80000) {
+        // No conversion happened: the sensor is still in sleep mode or the read is stale.
+        ESP_LOGW(TAG, "BME280 returns no data: adc_t=%d adc_p=%d adc_h=%d (cal T1=%u T2=%d T3=%d)",
+                 (int)adc_t, (int)adc_p, (int)adc_h, s_bme.t1, (int)s_bme.t2, (int)s_bme.t3);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
     int32_t v1 = (adc_t / 8 - (int32_t)s_bme.t1 * 2) * s_bme.t2 / 2048;
     int32_t v2 = (adc_t / 16 - (int32_t)s_bme.t1);
     v2 = (v2 * v2 / 4096) * s_bme.t3 / 16384;
@@ -256,6 +285,14 @@ static esp_err_t bme280_read(int16_t *temp_c_x100, uint16_t *hum_pct_x100, uint1
     if (h5v > 419430400) h5v = 419430400;
     *hum_pct_x100 = (uint16_t)((h5v / 4096) * 100 / 1024);   // 56.78 % -> 5678
 
+    // BME280 spec range is -40..85 C; outside that it is a bad read, not a cold room.
+    if (*temp_c_x100 < -4000 || *temp_c_x100 > 8500) {
+        const int shown = (int)*temp_c_x100;
+        ESP_LOGW(TAG, "BME280 implausible sample %d.%02d C: adc_t=%d adc_p=%d adc_h=%d (cal T1=%u T2=%d T3=%d)",
+                 shown / 100, abs(shown % 100), (int)adc_t, (int)adc_p, (int)adc_h,
+                 s_bme.t1, (int)s_bme.t2, (int)s_bme.t3);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
     return ESP_OK;
 }
 
@@ -273,6 +310,31 @@ static void rtc_start_if_halted(void)
     I2C_UNLOCK();
 }
 
+static uint8_t dec_to_bcd(uint8_t v) { return (uint8_t)(((v / 10) << 4) | (v % 10)); }
+
+// The RTC stores whatever you write to it: pass local time, the display shows it unchanged.
+static esp_err_t rtc_set_time(const rtc_time_w_t *t)
+{
+    static const int month_offset[12] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+    const int y = t->year - (t->month < 3);
+    const int dow = (y + y / 4 - y / 100 + y / 400 + month_offset[t->month - 1] + t->day) % 7; // 0 = Sunday
+
+    const uint8_t d[8] = {
+        0x00,                                  // start at register 0x00, Clock Halt cleared
+        dec_to_bcd(t->second),
+        dec_to_bcd(t->minute),
+        dec_to_bcd(t->hour),                   // bit 6 = 0 -> 24-hour mode
+        dec_to_bcd((uint8_t)(dow == 0 ? 7 : dow)),  // 1 = Monday .. 7 = Sunday
+        dec_to_bcd(t->day),
+        dec_to_bcd(t->month),
+        dec_to_bcd((uint8_t)(t->year - 2000)),
+    };
+    I2C_LOCK();
+    const esp_err_t err = i2c_master_transmit(s_rtc_dev, d, sizeof(d), 1000);
+    I2C_UNLOCK();
+    return err;
+}
+
 static esp_err_t rtc_read(rtc_time_t *t)
 {
     uint8_t d[7];
@@ -283,13 +345,16 @@ static esp_err_t rtc_read(rtc_time_t *t)
 
     t->second = bcd_to_dec((uint8_t)(d[0] & 0x7F));
     t->minute = bcd_to_dec((uint8_t)(d[1] & 0x7F));
-    int hour = bcd_to_dec((uint8_t)(d[2] & 0x1F));
+    int hour;
     if (d[2] & 0x40) {                  // DS1307 defaults to 12-hour mode after power-on
+        hour = bcd_to_dec((uint8_t)(d[2] & 0x1F));
         if (d[2] & 0x20) {
             if (hour < 12) hour += 12;  // PM
         } else if (hour == 12) {
             hour = 0;                   // 12 AM = midnight
         }
+    } else {
+        hour = bcd_to_dec((uint8_t)(d[2] & 0x3F));  // 24-hour mode: bit 5 is part of the hour
     }
     t->hour = (uint8_t)hour;
     t->day    = bcd_to_dec((uint8_t)(d[4] & 0x3F));
@@ -388,6 +453,8 @@ static void sensor_task(void *arg)
 
             if (bme280_read(&rec.temperature_c_x100, &rec.humidity_pct_x100, &rec.pressure_mmhg) != ESP_OK) {
                 ESP_LOGW(TAG, "BME280 read failed");
+                static uint8_t retry;                       // self-heal if init failed at boot
+                if (++retry >= 10) { retry = 0; bme280_init(); }
             } else if (xQueueSend(s_sensor_q, &rec, 0) != pdTRUE) {
                 ESP_LOGW(TAG, "sensor_queue full");
             }
@@ -527,7 +594,17 @@ static void manager_task(void *arg)
         while (xQueueReceive(s_cmd_q, &cmd, 0) == pdTRUE) {
             switch (cmd.type) {
             case CMD_HELP:
-                printf("commands: status | log on | log off | flush | dump [n] | erase | help\n");
+                printf("commands: status | log on | log off | flush | dump [n] | erase | settime YYYY-MM-DD HH:MM:SS | help\n");
+                break;
+
+            case CMD_SET_TIME:
+                if (rtc_set_time(&cmd.rtc) == ESP_OK) {
+                    printf("RTC set to %04d-%02d-%02d %02d:%02d:%02d\n",
+                           cmd.rtc.year, cmd.rtc.month, cmd.rtc.day,
+                           cmd.rtc.hour, cmd.rtc.minute, cmd.rtc.second);
+                } else {
+                    printf("settime failed\n");
+                }
                 break;
             case CMD_STATUS:
                 print_status(logging, full);
@@ -612,6 +689,24 @@ static void uart_task(void *arg)
             continue;
         }
         line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0') continue;
+
+        if (strncasecmp(line, "settime", 7) == 0) {   // needs its spaces, so parse it before normalizing
+            uart_command_t c = { .type = CMD_SET_TIME };
+            int y, mo, d, h, mi, s;
+            if (sscanf(line + 7, "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &s) != 6 &&
+                sscanf(line + 7, "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s) != 6) {
+                printf("usage: settime YYYY-MM-DD HH:MM:SS\n");
+                continue;
+            }
+            if (y < 2000 || y > 2099 || mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || s > 59) {
+                printf("settime: value out of range\n");
+                continue;
+            }
+            c.rtc = (rtc_time_w_t){ (int16_t)y, (uint8_t)mo, (uint8_t)d, (uint8_t)h, (uint8_t)mi, (uint8_t)s };
+            xQueueSend(s_cmd_q, &c, 0);
+            continue;
+        }
 
         char cmd[32];
         int n = 0;
