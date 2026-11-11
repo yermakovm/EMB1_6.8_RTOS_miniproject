@@ -235,6 +235,6 @@ Compile-time knobs (top of `src/main.c`):
 
 ```c
 #define WAKE_PERIOD_MS        1000  // one measurement + display cycle
-#define LOG_INTERVAL_MINUTES  1     // log to flash once every N minutes
+#define LOG_INTERVAL_SECONDS  10    // log to flash once every N seconds (10s for testing)
 #define FLASH_SECTOR_SIZE     4096  // RAM log buffer = 1 flash sector
 ```
