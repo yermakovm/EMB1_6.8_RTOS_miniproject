@@ -190,20 +190,11 @@ Supported commands:
 - `flush` — force write current RAM buffer to flash
 - `dump [n]` — print the last *n* records (default 20) of the last written sector
 - `erase` — erase log partition and clear log buffer
-- `settime YYYY-MM-DD HH:MM:SS` — write the DS1307 in 24-hour mode
 - `log on` — enable logging
 - `log off` — disable logging
 
 Parsing ignores spaces and case, so `log on`, `logon` and `LOG ON` are the same command.
 `erase` wipes 1 MB of flash, so the display freezes for a second or two while it runs.
-
-> The DS1307 only keeps what was last written to it — this firmware just reads it. If the display
-> shows the wrong time, set it once: `settime 2026-05-09 15:30:00`. Use **local** time, no timezone
-> is applied. A DS1307 with a dead battery or no crystal restarts at 2000-01-01 00:00.
-
-> If the OLED shows `NO SENSOR DATA` and the monitor prints `BME280 returns no data` or
-> `unexpected chip id`, sensor init failed — those warnings carry the raw ADC values and the
-> calibration coefficients, which tells a wiring problem from a formula problem.
 
 > Console caveat: between the 1-second cycles the chip is in Light Sleep. Input typed while
 > asleep is buffered by the console peripheral and processed on the next wake, but if you ever
